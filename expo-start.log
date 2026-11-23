@@ -1,0 +1,30 @@
+Starting project at C:\Projects\movile
+Starting Metro Bundler
+
+Waiting on http://localhost:8081
+
+Logs for your project will appear below.
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+| (node:14260) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+| (Use `node --trace-warnings ...` to show where the warning was created)
+iOS  ERROR  You're signed in to Expo CLI as "semyon_krotkih", but not signed in to Expo Go. Sign in to Expo Go as "semyon_krotkih" to open this project.
+iOS  ERROR  You're signed in to Expo CLI as "semyon_krotkih", but not signed in to Expo Go. Sign in to Expo Go as "semyon_krotkih" to open this project.
+iOS  ERROR  You're signed in to Expo CLI as "semyon_krotkih", but not signed in to Expo Go. Sign in to Expo Go as "semyon_krotkih" to open this project.
+iOS Bundled 17669ms index.ts (713 modules)
+iOS Bundled 5439ms index.ts (1 module)
+ ERROR  [ReferenceError: Property 'Button' doesn't exist]
