@@ -143,19 +143,47 @@ jobs:
           TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
           echo "--- Kudu: latest deployment before this one ---"
-          curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || true
-          echo
+          PREV=$(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || echo '{}')
+          echo "$PREV"
+          PREV_ID=$(echo "$PREV" | jq -r '.id // empty' 2>/dev/null || true)
 
-          echo "--- Deploying to https://$SCM_HOST/api/publish?type=zip ---"
+          # async=true: Oryx's pip install (torch, spaCy, ...) outlasts the ~230s gateway
+          # timeout of a synchronous request (HTTP 504), so start it and poll the status instead.
+          echo "--- Deploying to https://$SCM_HOST/api/publish?type=zip&async=true ---"
           STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/zip" \
             --data-binary @app.zip \
-            "https://$SCM_HOST/api/publish?type=zip")
+            "https://$SCM_HOST/api/publish?type=zip&async=true")
           echo "HTTP $STATUS"
-          echo "--- Kudu response ---"
           cat response.txt; echo
           case "$STATUS" in 2*) ;; *) exit 1 ;; esac
+
+          # Poll until Kudu reports the deployment complete (status 4 = success, 3 = failed)
+          for i in $(seq 1 120); do
+            sleep 20
+            # Refresh token occasionally; builds can run long
+            [ $((i % 30)) = 0 ] && TOKEN=$(az account get-access-token --query accessToken -o tsv)
+            DEP=$(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || echo '{}')
+            if [ "$(echo "$DEP" | jq -r '.id // empty')" = "$PREV_ID" ]; then
+              echo "[$i] waiting for new deployment to register..."; continue
+            fi
+            DEP_STATUS=$(echo "$DEP" | jq -r '.status // empty')
+            COMPLETE=$(echo "$DEP" | jq -r '.complete // false')
+            echo "[$i] status=$DEP_STATUS complete=$COMPLETE $(echo "$DEP" | jq -r '.progress // .status_text // empty')"
+            if [ "$COMPLETE" = "true" ]; then
+              if [ "$DEP_STATUS" = "4" ]; then echo "Deployment succeeded."; exit 0; fi
+              echo "::error::Deployment failed (status $DEP_STATUS). Build log:"
+              DEP_ID=$(echo "$DEP" | jq -r '.id')
+              for url in $(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/$DEP_ID/log" | jq -r '.[].details_url // empty'); do
+                curl -s -H "Authorization: Bearer $TOKEN" "$url" | jq -r '.[].message'
+              done
+              curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/$DEP_ID/log" | jq -r '.[].message'
+              exit 1
+            fi
+          done
+          echo "::error::Deployment did not complete within 40 minutes"
+          exit 1
 
       # Give the container time to load the ML models on startup, and set the command
       # that starts the API. Applied after deploy, then the restart below picks it up.
