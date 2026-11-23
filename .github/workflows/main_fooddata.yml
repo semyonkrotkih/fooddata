@@ -91,8 +91,31 @@ jobs:
           echo "AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP" >> "$GITHUB_ENV"
           echo "Using resource group: $AZURE_RESOURCE_GROUP"
 
-      # Deploy first: changing app settings/config right before OneDeploy restarts the
-      # SCM (Kudu) site and makes the deployment fail with 409 Conflict.
+      # OneDeploy returns 409 Conflict when another deployment is still running on Kudu
+      # (e.g. a previous Oryx build) or when WEBSITE_RUN_FROM_PACKAGE is set.
+      # Print the relevant state and wait for any in-progress deployment to finish.
+      - name: Check for conflicting deployments
+        run: |
+          SITE_ID=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query id -o tsv)
+          echo "SITE_ID=$SITE_ID" >> "$GITHUB_ENV"
+
+          echo "--- Relevant app settings ---"
+          az webapp config appsettings list -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
+            --query "[?name=='WEBSITE_RUN_FROM_PACKAGE' || name=='SCM_DO_BUILD_DURING_DEPLOYMENT' || name=='ENABLE_ORYX_BUILD'].{name:name,value:value}" -o table
+
+          echo "--- Recent deployments (status: 0 pending, 1 building, 2 deploying, 3 failed, 4 success) ---"
+          az rest --method get --url "https://management.azure.com${SITE_ID}/deployments?api-version=2023-12-01" \
+            --query "value[0:5].{id:name,status:properties.status,active:properties.active,start:properties.start_time,end:properties.end_time,msg:properties.message}" -o table || true
+
+          for i in $(seq 1 30); do
+            BUSY=$(az rest --method get --url "https://management.azure.com${SITE_ID}/deployments?api-version=2023-12-01" \
+              --query "length(value[?properties.status==\`0\` || properties.status==\`1\` || properties.status==\`2\`])" -o tsv 2>/dev/null || echo 0)
+            if [ "${BUSY:-0}" = "0" ]; then echo "No deployment in progress."; exit 0; fi
+            echo "Deployment in progress on Kudu ($BUSY), waiting... ($i/30)"
+            sleep 30
+          done
+          echo "::warning::A deployment is still in progress after 15 minutes; deploy will likely return 409."
+
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
@@ -100,6 +123,15 @@ jobs:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: 'Production'
           package: app
+
+      # On failure, print Kudu's own deployment log so the real reason shows up in the run
+      - name: Show Kudu deployment log
+        if: failure()
+        run: |
+          LATEST=$(az rest --method get --url "https://management.azure.com${SITE_ID}/deployments?api-version=2023-12-01" --query "value[0].name" -o tsv)
+          echo "Latest deployment: $LATEST"
+          az rest --method get --url "https://management.azure.com${SITE_ID}/deployments/${LATEST}/log?api-version=2023-12-01" \
+            --query "value[].{time:properties.log_time,message:properties.message,details:properties.details_url}" -o table || true
 
       # Give the container time to load the ML models on startup, and set the command
       # that starts the API. Applied after deploy, then the restart below picks it up.
