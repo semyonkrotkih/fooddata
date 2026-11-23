@@ -14,6 +14,11 @@ on:
       - '.github/workflows/main_fooddata.yml'
   workflow_dispatch:
 
+# Never run two deployments at once (overlapping OneDeploy calls also return 409)
+concurrency:
+  group: deploy-fooddata
+  cancel-in-progress: false
+
 env:
   APP_DIR: fooddata_api
   AZURE_WEBAPP_NAME: fooddata
@@ -86,21 +91,8 @@ jobs:
           echo "AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP" >> "$GITHUB_ENV"
           echo "Using resource group: $AZURE_RESOURCE_GROUP"
 
-      # Make sure Oryx installs requirements on deploy, give the container time to load
-      # the ML models on startup, and set the command that starts the API.
-      - name: Configure startup command and app settings
-        run: |
-          az webapp config appsettings set \
-            --name "$AZURE_WEBAPP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true WEBSITES_CONTAINER_START_TIME_LIMIT=1800 \
-            --output none
-          az webapp config set \
-            --name "$AZURE_WEBAPP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --startup-file "$STARTUP_COMMAND" \
-            --output none
-
+      # Deploy first: changing app settings/config right before OneDeploy restarts the
+      # SCM (Kudu) site and makes the deployment fail with 409 Conflict.
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
@@ -108,7 +100,21 @@ jobs:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: 'Production'
           package: app
-          startup-command: ${{ env.STARTUP_COMMAND }}
+
+      # Give the container time to load the ML models on startup, and set the command
+      # that starts the API. Applied after deploy, then the restart below picks it up.
+      - name: Configure startup command and app settings
+        run: |
+          az webapp config appsettings set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --settings WEBSITES_CONTAINER_START_TIME_LIMIT=1800 \
+            --output none
+          az webapp config set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --startup-file "$STARTUP_COMMAND" \
+            --output none
 
       - name: Restart web app
         run: az webapp restart --name "$AZURE_WEBAPP_NAME" --resource-group "$AZURE_RESOURCE_GROUP"
