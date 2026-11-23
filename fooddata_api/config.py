@@ -13,9 +13,9 @@ if IS_PRODUCTION:
         vault_url=vault_url,
         credential=credential
     )
-    EXPO_PUBLIC_API_URL = client.get_secret("EXPO_PUBLIC_API_URL").value
-    SQL_CONNECTION_STRING = client.get_secret("SQL_CONNECTION_STRING").value
-    ANTHROPIC_API_KEY = client.get_secret("ANTHROPIC_API_KEY").value
+    EXPO_PUBLIC_API_URL = client.get_secret("expo-public-api-url").value
+    SQL_CONNECTION_STRING = client.get_secret("sql-connection-string").value
+    ANTHROPIC_API_KEY = client.get_secret("anthropic-api-key").value
 
 else:
     EXPO_PUBLIC_API_URL = os.environ["EXPO_PUBLIC_API_URL"]
