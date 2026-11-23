@@ -8,7 +8,19 @@ on:
   push:
     branches:
       - 'main'
+    # Only run when the API (or this workflow) changes — app/Expo changes don't trigger a deploy
+    paths:
+      - 'fooddata_api/**'
+      - '.github/workflows/main_fooddata.yml'
   workflow_dispatch:
+
+env:
+  APP_DIR: fooddata_api
+  AZURE_WEBAPP_NAME: fooddata
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # optional; looked up automatically if unset
+  # Gunicorn + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
+  # Long timeout because spaCy / sentence-transformers models load at import time.
+  STARTUP_COMMAND: gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
 
 jobs:
   build:
@@ -24,28 +36,26 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 🛠️ Local Build Section (Optional)
-      # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
-      - name: Create and Start virtual environment and Install dependencies
+      # Local build check: catches dependency issues early. Oryx re-installs on Azure
+      # (SCM_DO_BUILD_DURING_DEPLOYMENT=true), so the venv itself is not deployed.
+      - name: Create virtual environment and install dependencies
+        working-directory: ${{ env.APP_DIR }}
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
-                
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+
+      # Only the contents of fooddata_api/ are packaged, so requirements.txt and api.py
+      # sit at the root of the deployed site (/home/site/wwwroot).
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
-            .
-            !antenv/
-
-      # 🚫 Opting Out of Oryx Build
-      # If you prefer to disable the Oryx build process during deployment, follow these steps:
-      # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
+            ${{ env.APP_DIR }}/
+            !${{ env.APP_DIR }}/antenv/
+            !${{ env.APP_DIR }}/**/__pycache__/
+          include-hidden-files: false
 
   deploy:
     runs-on: ubuntu-latest
@@ -59,7 +69,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+          path: app
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -67,10 +78,55 @@ jobs:
           tenant-id: "10d205c2-2d4f-4105-9d31-7c83c352f32e"
           subscription-id: "e276d1fb-8d8d-4aae-9c2f-42dc21a81670"
 
+      - name: Resolve resource group
+        run: |
+          if [ -z "$AZURE_RESOURCE_GROUP" ]; then
+            AZURE_RESOURCE_GROUP=$(az webapp list --query "[?name=='$AZURE_WEBAPP_NAME'].resourceGroup | [0]" -o tsv)
+          fi
+          echo "AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP" >> "$GITHUB_ENV"
+          echo "Using resource group: $AZURE_RESOURCE_GROUP"
+
+      # Make sure Oryx installs requirements on deploy, give the container time to load
+      # the ML models on startup, and set the command that starts the API.
+      - name: Configure startup command and app settings
+        run: |
+          az webapp config appsettings set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true WEBSITES_CONTAINER_START_TIME_LIMIT=1800 \
+            --output none
+          az webapp config set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --startup-file "$STARTUP_COMMAND" \
+            --output none
+
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'fooddata'
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
           slot-name: 'Production'
-          
+          package: app
+          startup-command: ${{ env.STARTUP_COMMAND }}
+
+      - name: Restart web app
+        run: az webapp restart --name "$AZURE_WEBAPP_NAME" --resource-group "$AZURE_RESOURCE_GROUP"
+
+      # Wait until the API is up and Swagger UI responds
+      - name: Verify API is running
+        run: |
+          URL="${{ steps.deploy-to-webapp.outputs.webapp-url }}"
+          echo "Waiting for $URL/docs ..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL/docs" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "API is up: $URL"
+              echo "Swagger UI: $URL/docs"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "API did not respond in time. Check logs: az webapp log tail -n $AZURE_WEBAPP_NAME -g $AZURE_RESOURCE_GROUP"
+          exit 1
