@@ -110,28 +110,37 @@ jobs:
           for i in $(seq 1 30); do
             BUSY=$(az rest --method get --url "https://management.azure.com${SITE_ID}/deployments?api-version=2023-12-01" \
               --query "length(value[?properties.status==\`0\` || properties.status==\`1\` || properties.status==\`2\`])" -o tsv 2>/dev/null || echo 0)
-            if [ "${BUSY:-0}" = "0" ]; then echo "No deployment in progress."; exit 0; fi
+            if [ "${BUSY:-0}" = "0" ]; then echo "No deployment in progress."; break; fi
             echo "Deployment in progress on Kudu ($BUSY), waiting... ($i/30)"
+            [ "$i" = "30" ] && echo "::warning::A deployment is still in progress after 15 minutes; deploy will likely return 409."
             sleep 30
           done
-          echo "::warning::A deployment is still in progress after 15 minutes; deploy will likely return 409."
 
+          echo "--- Site / deployment source config ---"
+          az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
+            --query "{kind:kind,state:state,plan:appServicePlanId}" -o table
+          az webapp config show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
+            --query "{scmType:scmType,linuxFxVersion:linuxFxVersion}" -o table
+          az resource show --ids "${SITE_ID}/basicPublishingCredentialsPolicies/scm" --query "{scmBasicAuth:properties.allow}" -o table || true
+
+      # Zip the API and push it with OneDeploy via the Azure CLI. Unlike azure/webapps-deploy,
+      # the CLI prints Kudu's error message (not just the status code) if the deploy is rejected.
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
-        with:
-          app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          slot-name: 'Production'
-          package: app
-
-      # On failure, print Kudu's own deployment log so the real reason shows up in the run
-      - name: Show Kudu deployment log
-        if: failure()
         run: |
-          LATEST=$(az rest --method get --url "https://management.azure.com${SITE_ID}/deployments?api-version=2023-12-01" --query "value[0].name" -o tsv)
-          echo "Latest deployment: $LATEST"
-          az rest --method get --url "https://management.azure.com${SITE_ID}/deployments/${LATEST}/log?api-version=2023-12-01" \
-            --query "value[].{time:properties.log_time,message:properties.message,details:properties.details_url}" -o table || true
+          cd app
+          zip -qr ../app.zip .
+          cd ..
+          ls -lh app.zip
+          az webapp deploy \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --src-path app.zip \
+            --type zip \
+            --track-status false \
+            --verbose
+          HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query defaultHostName -o tsv)
+          echo "webapp-url=https://$HOST" >> "$GITHUB_OUTPUT"
 
       # Give the container time to load the ML models on startup, and set the command
       # that starts the API. Applied after deploy, then the restart below picks it up.
