@@ -123,24 +123,39 @@ jobs:
             --query "{scmType:scmType,linuxFxVersion:linuxFxVersion}" -o table
           az resource show --ids "${SITE_ID}/basicPublishingCredentialsPolicies/scm" --query "{scmBasicAuth:properties.allow}" -o table || true
 
-      # Zip the API and push it with OneDeploy via the Azure CLI. Unlike azure/webapps-deploy,
-      # the CLI prints Kudu's error message (not just the status code) if the deploy is rejected.
+      # Zip the API and push it straight to Kudu's OneDeploy endpoint, printing Kudu's full
+      # response body so any rejection (400/409) shows its actual reason in the log.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         run: |
           cd app
           zip -qr ../app.zip .
           cd ..
-          ls -lh app.zip
-          az webapp deploy \
-            --name "$AZURE_WEBAPP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --src-path app.zip \
-            --type zip \
-            --track-status false \
-            --verbose
+          echo "--- Package contents ---"
+          unzip -l app.zip
+
+          echo "--- App setting names (values hidden) ---"
+          az webapp config appsettings list -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv
+
           HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query defaultHostName -o tsv)
+          SCM_HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)
           echo "webapp-url=https://$HOST" >> "$GITHUB_OUTPUT"
+          TOKEN=$(az account get-access-token --query accessToken -o tsv)
+
+          echo "--- Kudu: latest deployment before this one ---"
+          curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || true
+          echo
+
+          echo "--- Deploying to https://$SCM_HOST/api/publish?type=zip ---"
+          STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/zip" \
+            --data-binary @app.zip \
+            "https://$SCM_HOST/api/publish?type=zip")
+          echo "HTTP $STATUS"
+          echo "--- Kudu response ---"
+          cat response.txt; echo
+          case "$STATUS" in 2*) ;; *) exit 1 ;; esac
 
       # Give the container time to load the ML models on startup, and set the command
       # that starts the API. Applied after deploy, then the restart below picks it up.
