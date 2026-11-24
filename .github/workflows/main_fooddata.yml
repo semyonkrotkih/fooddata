@@ -24,9 +24,9 @@ env:
   APP_DIR: fooddata_api
   AZURE_WEBAPP_NAME: fooddata
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # optional; looked up automatically if unset
-  # Gunicorn (from the antenv venv built on Azure) + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
-  # Long timeout because spaCy / sentence-transformers models load at import time.
-  STARTUP_COMMAND: /home/site/wwwroot/antenv/bin/gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
+  # fooddata_api/startup.sh runs `pip install -r requirements.txt` in the app container
+  # (into /home/site/wwwroot/antenv), then starts Gunicorn + Uvicorn serving api:app.
+  STARTUP_COMMAND: bash /home/site/wwwroot/startup.sh
 
 jobs:
   build:
@@ -42,8 +42,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Local build check: catches dependency issues early. The venv is not deployed and
-      # nothing is installed on Azure during deployment.
+      # Local build check: catches dependency issues early. The venv is not deployed;
+      # dependencies are installed on Azure by startup.sh when the app starts.
       - name: Create virtual environment and install dependencies
         working-directory: ${{ env.APP_DIR }}
         run: |
@@ -56,7 +56,7 @@ jobs:
       - name: Stage deployment files
         run: |
           mkdir -p deploy
-          cp "$APP_DIR/api.py" "$APP_DIR/config.py" "$APP_DIR/requirements.txt" deploy/
+          cp "$APP_DIR/api.py" "$APP_DIR/config.py" "$APP_DIR/requirements.txt" "$APP_DIR/startup.sh" deploy/
           cp .env deploy/.env
 
       - name: Upload artifact for deployment jobs
@@ -127,7 +127,7 @@ jobs:
             --query "{scmType:scmType,linuxFxVersion:linuxFxVersion}" -o table
           az resource show --ids "${SITE_ID}/basicPublishingCredentialsPolicies/scm" --query "{scmBasicAuth:properties.allow}" -o table || true
 
-      # Copy only api.py, config.py, requirements.txt and .env into /home/site/wwwroot using
+      # Copy only api.py, config.py, requirements.txt, startup.sh and .env into /home/site/wwwroot using
       # Kudu OneDeploy type=static: each file is written as-is, with no Oryx build.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
@@ -138,7 +138,7 @@ jobs:
           echo "SCM_HOST=$SCM_HOST" >> "$GITHUB_ENV"
           TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
-          for f in api.py config.py requirements.txt .env; do
+          for f in api.py config.py requirements.txt startup.sh .env; do
             echo "--- Copying $f to /home/site/wwwroot/$f ---"
             STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
               -H "Authorization: Bearer $TOKEN" \
@@ -150,75 +150,9 @@ jobs:
             case "$STATUS" in 2*) ;; *) echo "::error::Failed to deploy $f"; exit 1 ;; esac
           done
 
-      # Run `pip install -r requirements.txt` on the App Service (in the Kudu container,
-      # which shares /home with the app) into /home/site/wwwroot/antenv. The install runs in
-      # the background and is polled, because torch & co. outlast Kudu's ~230s request timeout.
-      - name: Install dependencies on Azure Web App
-        run: |
-          TOKEN=$(az account get-access-token --query accessToken -o tsv)
-          PY_VERSION=$(az webapp config show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query linuxFxVersion -o tsv | cut -d'|' -f2)
-          echo "Runtime Python version: $PY_VERSION"
-
-          cat > install_deps.sh <<EOF
-          #!/bin/bash
-          cd /home/site/wwwroot
-          rm -f /home/site/install_deps.done
-          PY=/opt/python/$PY_VERSION/bin/python3
-          [ -x "\$PY" ] || PY=python3
-          echo "Using \$PY (\$(\$PY --version))"
-          (
-            [ -x antenv/bin/python ] || \$PY -m venv antenv
-            antenv/bin/pip install --upgrade pip &&
-            antenv/bin/pip install -r requirements.txt
-          )
-          echo \$? > /home/site/install_deps.done
-          EOF
-          sed -i 's/^          //' install_deps.sh
-
-          kudu_cmd() {
-            curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-              --data "$(jq -n --arg c "$1" '{command: $c, dir: "/home/site"}')" \
-              "https://$SCM_HOST/api/command"
-          }
-
-          # Launcher that starts the install detached from the Kudu request. Kudu's command
-          # API mangles quotes, so everything quoted lives in scripts, not in the command.
-          printf '%s\n' '#!/bin/bash' \
-            'rm -f /home/site/install_deps.done' \
-            'setsid nohup bash /home/site/install_deps.sh > /home/LogFiles/install_deps.log 2>&1 < /dev/null &' \
-            'echo started' > start_install.sh
-
-          for f in install_deps.sh start_install.sh; do
-            echo "--- Uploading $f ---"
-            STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary @"$f" \
-              "https://$SCM_HOST/api/publish?type=static&path=/home/site/$f&restart=false")
-            echo "HTTP $STATUS"; cat response.txt; echo
-            case "$STATUS" in 2*) ;; *) exit 1 ;; esac
-          done
-
-          echo "--- Starting pip install -r requirements.txt ---"
-          kudu_cmd "bash /home/site/start_install.sh" | jq -r '.Output, .Error'
-
-          for i in $(seq 1 120); do
-            sleep 20
-            [ $((i % 30)) = 0 ] && TOKEN=$(az account get-access-token --query accessToken -o tsv)
-            RC=$(kudu_cmd "cat /home/site/install_deps.done" | jq -r '.Output // empty' | tr -d '[:space:]')
-            echo "[$i] $(kudu_cmd "tail -n 1 /home/LogFiles/install_deps.log" | jq -r '.Output // empty')"
-            if [ -n "$RC" ]; then
-              echo "--- install log ---"
-              kudu_cmd "tail -n 50 /home/LogFiles/install_deps.log" | jq -r '.Output'
-              if [ "$RC" = "0" ]; then echo "Dependencies installed."; exit 0; fi
-              echo "::error::pip install failed (exit code $RC)"; exit 1
-            fi
-          done
-          echo "::error::pip install did not finish within 40 minutes"
-          exit 1
-
-      # Give the container time to load the ML models on startup, and set the command
-      # that starts the API. Applied after deploy, then the restart below picks it up.
+      # Give the container time to install dependencies (first start after a requirements.txt
+      # change) and load the ML models, and set the command that starts the API.
+      # Applied after deploy, then the restart below picks it up.
       - name: Configure startup command and app settings
         run: |
           az webapp config appsettings set \
@@ -240,7 +174,8 @@ jobs:
         run: |
           URL="${{ steps.deploy-to-webapp.outputs.webapp-url }}"
           echo "Waiting for $URL/docs ..."
-          for i in $(seq 1 40); do
+          # Up to 30 min, matching WEBSITES_CONTAINER_START_TIME_LIMIT (pip install runs at startup)
+          for i in $(seq 1 60); do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL/docs" || true)
             echo "Attempt $i: HTTP $STATUS"
             if [ "$STATUS" = "200" ]; then
