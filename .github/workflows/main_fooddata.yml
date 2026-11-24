@@ -11,6 +11,7 @@ on:
     # Only run when the API (or this workflow) changes — app/Expo changes don't trigger a deploy
     paths:
       - 'fooddata_api/**'
+      - '.env'
       - '.github/workflows/main_fooddata.yml'
   workflow_dispatch:
 
@@ -23,9 +24,9 @@ env:
   APP_DIR: fooddata_api
   AZURE_WEBAPP_NAME: fooddata
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # optional; looked up automatically if unset
-  # Gunicorn + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
+  # Gunicorn (from the antenv venv built on Azure) + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
   # Long timeout because spaCy / sentence-transformers models load at import time.
-  STARTUP_COMMAND: gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
+  STARTUP_COMMAND: /home/site/wwwroot/antenv/bin/gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
 
 jobs:
   build:
@@ -41,8 +42,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Local build check: catches dependency issues early. Oryx re-installs on Azure
-      # (SCM_DO_BUILD_DURING_DEPLOYMENT=true), so the venv itself is not deployed.
+      # Local build check: catches dependency issues early. The venv is not deployed and
+      # nothing is installed on Azure during deployment.
       - name: Create virtual environment and install dependencies
         working-directory: ${{ env.APP_DIR }}
         run: |
@@ -50,17 +51,20 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
 
-      # Only the contents of fooddata_api/ are packaged, so requirements.txt and api.py
-      # sit at the root of the deployed site (/home/site/wwwroot).
+      # Only the files that get deployed are packaged, flat at the artifact root:
+      # the API files from fooddata_api/ plus .env from the repo root (its parent folder).
+      - name: Stage deployment files
+        run: |
+          mkdir -p deploy
+          cp "$APP_DIR/api.py" "$APP_DIR/config.py" "$APP_DIR/requirements.txt" deploy/
+          cp .env deploy/.env
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            ${{ env.APP_DIR }}/
-            !${{ env.APP_DIR }}/antenv/
-            !${{ env.APP_DIR }}/**/__pycache__/
-          include-hidden-files: false
+          path: deploy/
+          include-hidden-files: true
 
   deploy:
     runs-on: ubuntu-latest
@@ -123,66 +127,85 @@ jobs:
             --query "{scmType:scmType,linuxFxVersion:linuxFxVersion}" -o table
           az resource show --ids "${SITE_ID}/basicPublishingCredentialsPolicies/scm" --query "{scmBasicAuth:properties.allow}" -o table || true
 
-      # Zip the API and push it straight to Kudu's OneDeploy endpoint, printing Kudu's full
-      # response body so any rejection (400/409) shows its actual reason in the log.
+      # Copy only api.py, config.py, requirements.txt and .env into /home/site/wwwroot using
+      # Kudu OneDeploy type=static: each file is written as-is, with no Oryx build.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         run: |
-          cd app
-          zip -qr ../app.zip .
-          cd ..
-          echo "--- Package contents ---"
-          unzip -l app.zip
-
-          echo "--- App setting names (values hidden) ---"
-          az webapp config appsettings list -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query "[].name" -o tsv
-
           HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query defaultHostName -o tsv)
           SCM_HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)
           echo "webapp-url=https://$HOST" >> "$GITHUB_OUTPUT"
+          echo "SCM_HOST=$SCM_HOST" >> "$GITHUB_ENV"
           TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
-          echo "--- Kudu: latest deployment before this one ---"
-          PREV=$(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || echo '{}')
-          echo "$PREV"
-          PREV_ID=$(echo "$PREV" | jq -r '.id // empty' 2>/dev/null || true)
+          for f in api.py config.py requirements.txt .env; do
+            echo "--- Copying $f to /home/site/wwwroot/$f ---"
+            STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"app/$f" \
+              "https://$SCM_HOST/api/publish?type=static&path=/home/site/wwwroot/$f&restart=false")
+            echo "HTTP $STATUS"
+            cat response.txt; echo
+            case "$STATUS" in 2*) ;; *) echo "::error::Failed to deploy $f"; exit 1 ;; esac
+          done
 
-          # async=true: Oryx's pip install (torch, spaCy, ...) outlasts the ~230s gateway
-          # timeout of a synchronous request (HTTP 504), so start it and poll the status instead.
-          echo "--- Deploying to https://$SCM_HOST/api/publish?type=zip&async=true ---"
+      # Run `pip install -r requirements.txt` on the App Service (in the Kudu container,
+      # which shares /home with the app) into /home/site/wwwroot/antenv. The install runs in
+      # the background and is polled, because torch & co. outlast Kudu's ~230s request timeout.
+      - name: Install dependencies on Azure Web App
+        run: |
+          TOKEN=$(az account get-access-token --query accessToken -o tsv)
+          PY_VERSION=$(az webapp config show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query linuxFxVersion -o tsv | cut -d'|' -f2)
+          echo "Runtime Python version: $PY_VERSION"
+
+          cat > install_deps.sh <<EOF
+          #!/bin/bash
+          cd /home/site/wwwroot
+          rm -f /home/site/install_deps.done
+          PY=/opt/python/$PY_VERSION/bin/python3
+          [ -x "\$PY" ] || PY=python3
+          echo "Using \$PY (\$(\$PY --version))"
+          (
+            [ -x antenv/bin/python ] || \$PY -m venv antenv
+            antenv/bin/pip install --upgrade pip &&
+            antenv/bin/pip install -r requirements.txt
+          )
+          echo \$? > /home/site/install_deps.done
+          EOF
+          sed -i 's/^          //' install_deps.sh
+
+          kudu_cmd() {
+            curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+              --data "$(jq -n --arg c "$1" '{command: $c, dir: "/home/site"}')" \
+              "https://$SCM_HOST/api/command"
+          }
+
+          echo "--- Uploading install script ---"
           STATUS=$(curl -s -o response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/zip" \
-            --data-binary @app.zip \
-            "https://$SCM_HOST/api/publish?type=zip&async=true")
-          echo "HTTP $STATUS"
-          cat response.txt; echo
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @install_deps.sh \
+            "https://$SCM_HOST/api/publish?type=static&path=/home/site/install_deps.sh&restart=false")
+          echo "HTTP $STATUS"; cat response.txt; echo
           case "$STATUS" in 2*) ;; *) exit 1 ;; esac
 
-          # Poll until Kudu reports the deployment complete (status 4 = success, 3 = failed)
+          echo "--- Starting pip install -r requirements.txt ---"
+          kudu_cmd "bash -c 'rm -f /home/site/install_deps.done; nohup bash /home/site/install_deps.sh > /home/LogFiles/install_deps.log 2>&1 &'" | jq -r '.Output, .Error'
+
           for i in $(seq 1 120); do
             sleep 20
-            # Refresh token occasionally; builds can run long
             [ $((i % 30)) = 0 ] && TOKEN=$(az account get-access-token --query accessToken -o tsv)
-            DEP=$(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/latest" || echo '{}')
-            if [ "$(echo "$DEP" | jq -r '.id // empty')" = "$PREV_ID" ]; then
-              echo "[$i] waiting for new deployment to register..."; continue
-            fi
-            DEP_STATUS=$(echo "$DEP" | jq -r '.status // empty')
-            COMPLETE=$(echo "$DEP" | jq -r '.complete // false')
-            echo "[$i] status=$DEP_STATUS complete=$COMPLETE $(echo "$DEP" | jq -r '.progress // .status_text // empty')"
-            if [ "$COMPLETE" = "true" ]; then
-              if [ "$DEP_STATUS" = "4" ]; then echo "Deployment succeeded."; exit 0; fi
-              echo "::error::Deployment failed (status $DEP_STATUS). Build log:"
-              DEP_ID=$(echo "$DEP" | jq -r '.id')
-              for url in $(curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/$DEP_ID/log" | jq -r '.[].details_url // empty'); do
-                curl -s -H "Authorization: Bearer $TOKEN" "$url" | jq -r '.[].message'
-              done
-              curl -s -H "Authorization: Bearer $TOKEN" "https://$SCM_HOST/api/deployments/$DEP_ID/log" | jq -r '.[].message'
-              exit 1
+            RC=$(kudu_cmd "cat /home/site/install_deps.done" | jq -r '.Output // empty' | tr -d '[:space:]')
+            echo "[$i] $(kudu_cmd "tail -n 1 /home/LogFiles/install_deps.log" | jq -r '.Output // empty')"
+            if [ -n "$RC" ]; then
+              echo "--- install log ---"
+              kudu_cmd "tail -n 50 /home/LogFiles/install_deps.log" | jq -r '.Output'
+              if [ "$RC" = "0" ]; then echo "Dependencies installed."; exit 0; fi
+              echo "::error::pip install failed (exit code $RC)"; exit 1
             fi
           done
-          echo "::error::Deployment did not complete within 40 minutes"
+          echo "::error::pip install did not finish within 40 minutes"
           exit 1
 
       # Give the container time to load the ML models on startup, and set the command
