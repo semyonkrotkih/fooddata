@@ -1,9 +1,12 @@
+import os
 import re
+import traceback
 import anthropic
 import requests
 import spacy
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from sentence_transformers import SentenceTransformer, util
@@ -38,6 +41,22 @@ class Nutrient(BaseModel):
 
 app = FastAPI()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Return the stack trace of unhandled exceptions in the 500 response body.
+# On by default; set SHOW_STACK_TRACES=false to return only a generic error.
+# HTTPExceptions raised by the endpoints keep their own status code and detail.
+SHOW_STACK_TRACES = os.getenv("SHOW_STACK_TRACES", "true").lower() in ("1", "true", "yes")
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    content = {"detail": "Internal Server Error"}
+    if SHOW_STACK_TRACES:
+        content.update({
+            "error": f"{type(exc).__name__}: {exc}",
+            "path": request.url.path,
+            "traceback": traceback.format_exception(exc),
+        })
+    return JSONResponse(status_code=500, content=content)
 
 nlp = spacy.load("da_core_news_sm")
 model = SentenceTransformer('intfloat/multilingual-e5-small')
