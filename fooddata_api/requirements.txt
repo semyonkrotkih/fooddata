@@ -11,4 +11,5 @@ spacy>=3.8.0,<3.9.0
 torch>=2.5.0
 azure.identity>=1.17.0
 azure.keyvault.secrets>=4.9.0
+python-dotenv>=1.0.0
 da_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/da_core_news_sm-3.8.0/da_core_news_sm-3.8.0-py3-none-any.whl

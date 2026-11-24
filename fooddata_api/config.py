@@ -1,6 +1,14 @@
 import os
+from pathlib import Path
 
-APP_ENV = os.getenv("APP_ENV", "development")
+from dotenv import load_dotenv
+
+# Load .env deployed next to this file (/home/site/wwwroot/.env on Azure).
+# Variables already set in the environment (e.g. App Service app settings) take precedence.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
+# .env files use APP_ENVIRONMENT; APP_ENV is still accepted for backwards compatibility.
+APP_ENV = os.getenv("APP_ENVIRONMENT")
 IS_PRODUCTION = APP_ENV.lower() == "production"
 
 if IS_PRODUCTION:
