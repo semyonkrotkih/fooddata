@@ -12,7 +12,6 @@ on:
     paths:
       - 'fooddata_api/**'
       - '.env'
-      - '.env'
       - '.github/workflows/main_fooddata.yml'
   workflow_dispatch:
 
@@ -26,9 +25,7 @@ env:
   AZURE_WEBAPP_NAME: fooddata
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # optional; looked up automatically if unset
   # Gunicorn (from the antenv venv built on Azure) + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
-  # Gunicorn (from the antenv venv built on Azure) + Uvicorn worker serving the FastAPI instance `app` in fooddata_api/api.py.
   # Long timeout because spaCy / sentence-transformers models load at import time.
-  STARTUP_COMMAND: /home/site/wwwroot/antenv/bin/gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
   STARTUP_COMMAND: /home/site/wwwroot/antenv/bin/gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:8000 api:app
 
 jobs:
@@ -47,8 +44,6 @@ jobs:
 
       # Local build check: catches dependency issues early. The venv is not deployed and
       # nothing is installed on Azure during deployment.
-      # Local build check: catches dependency issues early. The venv is not deployed and
-      # nothing is installed on Azure during deployment.
       - name: Create virtual environment and install dependencies
         working-directory: ${{ env.APP_DIR }}
         run: |
@@ -64,20 +59,10 @@ jobs:
           cp "$APP_DIR/api.py" "$APP_DIR/config.py" "$APP_DIR/requirements.txt" deploy/
           cp .env deploy/.env
 
-      # Only the files that get deployed are packaged, flat at the artifact root:
-      # the API files from fooddata_api/ plus .env from the repo root (its parent folder).
-      - name: Stage deployment files
-        run: |
-          mkdir -p deploy
-          cp "$APP_DIR/api.py" "$APP_DIR/config.py" "$APP_DIR/requirements.txt" deploy/
-          cp .env deploy/.env
-
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: deploy/
-          include-hidden-files: true
           path: deploy/
           include-hidden-files: true
 
@@ -144,15 +129,12 @@ jobs:
 
       # Copy only api.py, config.py, requirements.txt and .env into /home/site/wwwroot using
       # Kudu OneDeploy type=static: each file is written as-is, with no Oryx build.
-      # Copy only api.py, config.py, requirements.txt and .env into /home/site/wwwroot using
-      # Kudu OneDeploy type=static: each file is written as-is, with no Oryx build.
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         run: |
           HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query defaultHostName -o tsv)
           SCM_HOST=$(az webapp show -n "$AZURE_WEBAPP_NAME" -g "$AZURE_RESOURCE_GROUP" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)
           echo "webapp-url=https://$HOST" >> "$GITHUB_OUTPUT"
-          echo "SCM_HOST=$SCM_HOST" >> "$GITHUB_ENV"
           echo "SCM_HOST=$SCM_HOST" >> "$GITHUB_ENV"
           TOKEN=$(az account get-access-token --query accessToken -o tsv)
 
@@ -230,16 +212,8 @@ jobs:
               kudu_cmd "tail -n 50 /home/LogFiles/install_deps.log" | jq -r '.Output'
               if [ "$RC" = "0" ]; then echo "Dependencies installed."; exit 0; fi
               echo "::error::pip install failed (exit code $RC)"; exit 1
-            RC=$(kudu_cmd "cat /home/site/install_deps.done" | jq -r '.Output // empty' | tr -d '[:space:]')
-            echo "[$i] $(kudu_cmd "tail -n 1 /home/LogFiles/install_deps.log" | jq -r '.Output // empty')"
-            if [ -n "$RC" ]; then
-              echo "--- install log ---"
-              kudu_cmd "tail -n 50 /home/LogFiles/install_deps.log" | jq -r '.Output'
-              if [ "$RC" = "0" ]; then echo "Dependencies installed."; exit 0; fi
-              echo "::error::pip install failed (exit code $RC)"; exit 1
             fi
           done
-          echo "::error::pip install did not finish within 40 minutes"
           echo "::error::pip install did not finish within 40 minutes"
           exit 1
 
